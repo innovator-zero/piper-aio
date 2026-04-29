@@ -1,0 +1,17 @@
+shared_defaults:
+  default_left0: &default_left0 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  default_right0: &default_right0 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+
+towel:
+  language_instruction: "Fold the towel."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+  action_postprocess:
+    left_gripper:
+      - when: below
+        threshold: 0.02
+        set: 0.0
+    right_gripper:
+      - when: below
+        threshold: 0.02
+        set: 0.0

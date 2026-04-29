@@ -1,0 +1,2 @@
+conda activate piperaio
+roslaunch realsense2_camera multi_camera.launch

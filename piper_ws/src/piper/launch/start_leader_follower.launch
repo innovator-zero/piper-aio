@@ -1,0 +1,31 @@
+<launch>
+  <!-- mode: 0 = read leader/follower and forward to ROS; 1 = control follower from leader topics -->
+  <arg name="mode" default="0" />
+  <arg name="auto_enable" default="true" />
+
+  <!-- Left arm node -->
+  <node name="$(anon piper_left)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_left" />
+    <param name="mode" value="$(arg mode)" />
+    <param name="auto_enable" value="$(arg auto_enable)" />
+    <remap from="/follower/arm_status" to="/follower/arm_status_left" />
+    <remap from="/follower/joint_states" to="/follower/joint_left" />
+    <remap from="/leader/joint_states" to="/leader/joint_left" />
+    <remap from="/follower/end_pose" to="/follower/end_pose_left" />
+    <remap from="/follower/end_pose_euler" to="/follower/end_pose_euler_left" />
+    <remap from="/pos_cmd" to="/follower/pos_cmd_left" />
+  </node>
+
+  <!-- Right arm node -->
+  <node name="$(anon piper_right)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_right" />
+    <param name="mode" value="$(arg mode)" />
+    <param name="auto_enable" value="$(arg auto_enable)" />
+    <remap from="/follower/arm_status" to="/follower/arm_status_right" />
+    <remap from="/follower/joint_states" to="/follower/joint_right" />
+    <remap from="/leader/joint_states" to="/leader/joint_right" />
+    <remap from="/follower/end_pose" to="/follower/end_pose_right" />
+    <remap from="/follower/end_pose_euler" to="/follower/end_pose_euler_right" />
+    <remap from="/pos_cmd" to="/follower/pos_cmd_right" />
+  </node>
+</launch>
