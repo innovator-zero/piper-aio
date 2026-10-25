@@ -1,2 +1,7 @@
+#!/bin/bash
+
+set -e
+
+eval "$(conda shell.bash hook)"
 conda activate piperaio
-roslaunch realsense2_camera multi_camera.launch
+exec roslaunch realsense2_camera multi_camera.launch

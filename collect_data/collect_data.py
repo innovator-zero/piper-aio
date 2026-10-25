@@ -9,6 +9,7 @@ import tty
 
 import h5py
 import rospy
+from std_srvs.srv import Trigger
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -46,6 +47,31 @@ class KeyboardHandler:
                 key = sys.stdin.read(1)
                 if key in valid_keys:
                     return key
+
+
+def call_trigger_service(service_name, timeout):
+    print(f"\033[33mCalling {service_name}...\033[0m")
+    rospy.wait_for_service(service_name, timeout=timeout)
+    response = rospy.ServiceProxy(service_name, Trigger)()
+    if not response.success:
+        raise RuntimeError(f"{service_name} failed: {response.message}")
+    print(f"\033[32m{service_name} succeeded: {response.message}\033[0m")
+
+
+def configure_zero_mode(args):
+    if args.fix_zero != "left":
+        call_trigger_service(args.restore_arm_left_service, args.zero_arm_service_timeout)
+    if args.fix_zero != "right":
+        call_trigger_service(args.restore_arm_right_service, args.zero_arm_service_timeout)
+    if args.fix_zero == "none":
+        return
+
+    service_name = args.zero_arm_left_service if args.fix_zero == "left" else args.zero_arm_right_service
+    call_trigger_service(service_name, args.zero_arm_service_timeout)
+    if args.zero_arm_settle_time > 0:
+        print(f"\033[33mWaiting {args.zero_arm_settle_time:.1f}s for zero position to settle...\033[0m")
+        time.sleep(args.zero_arm_settle_time)
+    print(f"\033[32m{args.fix_zero} arm zero-position mode requested.\033[0m")
 
 
 def save_data(args, timesteps, actions, dataset_path):
@@ -249,7 +275,61 @@ def get_arguments():
         default="/follower/end_pose_euler_right",
         required=False,
     )
-
+    parser.add_argument(
+        "--fix_zero",
+        choices=["none", "left", "right"],
+        default="none",
+        help="Move selected arm(s) to zero at startup using Piper mode-0 zero services.",
+        required=False,
+    )
+    parser.add_argument(
+        "--zero_arm_left_service",
+        action="store",
+        type=str,
+        help="Service used to move the left leader/follower arm pair to zero.",
+        default="/can_left/go_zero_leader_follower",
+        required=False,
+    )
+    parser.add_argument(
+        "--zero_arm_right_service",
+        action="store",
+        type=str,
+        help="Service used to move the right leader/follower arm pair to zero.",
+        default="/can_right/go_zero_leader_follower",
+        required=False,
+    )
+    parser.add_argument(
+        "--restore_arm_left_service",
+        action="store",
+        type=str,
+        help="Service used to restore the left arm to leader-follower mode.",
+        default="/can_left/restore_leader_follower_mode",
+        required=False,
+    )
+    parser.add_argument(
+        "--restore_arm_right_service",
+        action="store",
+        type=str,
+        help="Service used to restore the right arm to leader-follower mode.",
+        default="/can_right/restore_leader_follower_mode",
+        required=False,
+    )
+    parser.add_argument(
+        "--zero_arm_service_timeout",
+        action="store",
+        type=float,
+        help="Seconds to wait for zero-arm services.",
+        default=10.0,
+        required=False,
+    )
+    parser.add_argument(
+        "--zero_arm_settle_time",
+        action="store",
+        type=float,
+        help="Seconds to wait after zero-arm service calls before recording.",
+        default=5.0,
+        required=False,
+    )
     # collect depth image
     parser.add_argument(
         "--use_depth_image",
@@ -293,6 +373,7 @@ def main():
     if len(args.camera_names) != 3:
         raise ValueError("--camera_names must contain exactly 3 names for front/left/right cameras.")
     ros_operator = RosOperator(args, mode="collection")
+    configure_zero_mode(args)
     dataset_dir = os.path.join(args.dataset_dir, args.task_name)
 
     # Create dataset directory if it doesn't exist

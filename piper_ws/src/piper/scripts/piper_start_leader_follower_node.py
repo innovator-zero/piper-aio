@@ -2,6 +2,8 @@
 # Leader-follower Piper node.
 # mode=0 publishes both leader and follower arm state to ROS.
 # mode=1 controls the follower arm from leader topics.
+# DAgger support: /teach/* topics allow runtime switching between teach mode
+# (human drags leader, follower mirrors) and follower-control mode (policy controls).
 import math
 import threading
 import time
@@ -13,7 +15,7 @@ from piper_msgs.msg import PiperStatusMsg, PosCmd
 from piper_sdk import *
 from piper_sdk import C_PiperInterface
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Trigger, TriggerResponse
 from tf.transformations import quaternion_from_euler
 
@@ -25,6 +27,14 @@ def check_roscore():
     except rosnode.ROSNodeIOException:
         rospy.logerr("roscore is not running.")
         raise RuntimeError("roscore is not running.")
+
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 class C_PiperRosNode:
@@ -49,12 +59,23 @@ class C_PiperRosNode:
             rospy.loginfo("mode parameter not found, please use _mode:=0.")
             exit(0)
 
+        self.dagger_leader = False
+        if rospy.has_param("~dagger_leader"):
+            self.dagger_leader = _to_bool(rospy.get_param("~dagger_leader")) and self.mode == 0
+        rospy.loginfo("%s is %s", rospy.resolve_name("~dagger_leader"), self.dagger_leader)
+
         self.auto_enable = False
         if rospy.has_param("~auto_enable"):
-            if rospy.get_param("~auto_enable") and self.mode == 1:
+            if _to_bool(rospy.get_param("~auto_enable")) and self.mode == 1:
                 self.auto_enable = True
         rospy.loginfo("%s is %s", rospy.resolve_name("~auto_enable"), self.auto_enable)
         self.gripper_exist = True
+
+        # DAgger teach-mode state. This is active only for dedicated 4CAN
+        # leader nodes launched with ~dagger_leader:=true.
+        self.is_enabled = False
+        self.current_linkage_config = 0xFC
+        self.in_teach_mode = False
         # publish
         self.joint_std_pub_follower = rospy.Publisher(
             "/follower/joint_states", JointState, queue_size=1, tcp_nodelay=True
@@ -96,6 +117,10 @@ class C_PiperRosNode:
 
         self.piper = C_PiperInterface(can_name=self.can_port)
         self.piper.ConnectPort()
+
+        if self.dagger_leader:
+            self._configure_dagger_linkage(self.current_linkage_config)
+
         # service
         str_can_port = str(self.can_port)
         # Leader arm home service.
@@ -129,6 +154,11 @@ class C_PiperRosNode:
             sub_joint_th.start()
             sub_enable_th.start()
 
+        if self.dagger_leader:
+            teach_ctrl_th = threading.Thread(target=self.SubTeachControlThread)
+            teach_ctrl_th.daemon = True
+            teach_ctrl_th.start()
+
     def GetEnableFlag(self):
         return self.__enable_flag
 
@@ -155,6 +185,7 @@ class C_PiperRosNode:
                     print("Enable Status:", enable_flag)
                     if enable_flag:
                         self.__enable_flag = True
+                        self.is_enabled = True
                     self.piper.EnableArm(7)
                     self.piper.GripperCtrl(0, 1000, 0x02, 0)
                     self.piper.GripperCtrl(0, 1000, 0x01, 0)
@@ -172,7 +203,7 @@ class C_PiperRosNode:
             self.PublishFollowerArmJointAndGripper()
             self.PublishFollowerArmState()
             self.PublishFollowerArmEndPose()
-            if self.mode == 0:
+            if self.mode == 0 and (not self.dagger_leader or self.in_teach_mode):
                 self.PublishLeaderArmJointAndGripper()
 
             rate.sleep()
@@ -289,6 +320,17 @@ class C_PiperRosNode:
         joint_4: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_5 / 1000) * 0.017444
         joint_5: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_6 / 1000) * 0.017444
         joint_6: float = self.piper.GetArmGripperCtrl().gripper_ctrl.grippers_angle / 1000000
+        # Fallback: in teach mode GetArmJointCtrl() may return zeros if the CAN ctrl
+        # channel is inactive. Use feedback positions instead (matches dagger reference).
+        if self.in_teach_mode and abs(joint_0) < 0.001 and abs(joint_1) < 0.001 and abs(joint_2) < 0.001:
+            rospy.logwarn_throttle(1, "GetArmJointCtrl returned zeros in teach mode, using feedback positions")
+            joint_0 = (self.piper.GetArmJointMsgs().joint_state.joint_1 / 1000) * 0.017444
+            joint_1 = (self.piper.GetArmJointMsgs().joint_state.joint_2 / 1000) * 0.017444
+            joint_2 = (self.piper.GetArmJointMsgs().joint_state.joint_3 / 1000) * 0.017444
+            joint_3 = (self.piper.GetArmJointMsgs().joint_state.joint_4 / 1000) * 0.017444
+            joint_4 = (self.piper.GetArmJointMsgs().joint_state.joint_5 / 1000) * 0.017444
+            joint_5 = (self.piper.GetArmJointMsgs().joint_state.joint_6 / 1000) * 0.017444
+            joint_6 = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle / 1000000
         self.joint_state_leader.position = [
             joint_0,
             joint_1,
@@ -299,6 +341,152 @@ class C_PiperRosNode:
             joint_6,
         ]  # Example values
         self.joint_std_pub_leader.publish(self.joint_state_leader)
+
+    def SubTeachControlThread(self):
+        """Subscribe to 4CAN DAgger leader runtime control topics."""
+        rospy.Subscriber("/teach/enable", Bool, self.teach_enable_callback, queue_size=1)
+        rospy.Subscriber("/teach/linkage_config", String, self.teach_linkage_config_callback, queue_size=1)
+        rospy.Subscriber("/teach/teach_mode", Int32, self.teach_mode_callback, queue_size=1)
+        rospy.Subscriber(
+            "/leader_cmd/joint_states", JointState,
+            self.controlled_joint_callback, queue_size=1, tcp_nodelay=True,
+        )
+        rospy.spin()
+
+    def _configure_dagger_linkage(self, linkage_config):
+        """Configure 4CAN leader linkage without changing enable state."""
+        try:
+            self.piper.MasterSlaveConfig(
+                linkage_config=linkage_config,
+                feedback_offset=0x00,
+                ctrl_offset=0x00,
+                linkage_offset=0x00,
+            )
+            self.current_linkage_config = linkage_config
+            rospy.loginfo("DAgger leader: linkage configured to 0x%02X", linkage_config)
+            time.sleep(2)
+        except Exception as e:
+            rospy.logerr("DAgger leader linkage init failed: %s", e)
+
+    def teach_enable_callback(self, msg):
+        """Enable or disable the arm (used when entering/exiting DAgger mode)."""
+        if not self.dagger_leader:
+            return
+        try:
+            if msg.data and not self.is_enabled:
+                self.piper.EnableArm(7)
+                self.is_enabled = True
+                self.__enable_flag = True
+                rospy.loginfo("DAgger: arm enabled")
+                time.sleep(2)
+                if self.current_linkage_config == 0xFA:
+                    self._dagger_init_teach_mode()
+                else:
+                    self._dagger_init_follower_control_mode()
+            elif not msg.data and self.is_enabled:
+                self.piper.DisableArm(7)
+                self.is_enabled = False
+                self.__enable_flag = False
+                rospy.loginfo("DAgger: arm disabled")
+        except Exception as e:
+            rospy.logerr("DAgger enable callback failed: %s", e)
+
+    def teach_linkage_config_callback(self, msg):
+        """Switch arm between teach mode (0xFA) and follower-control/CAN-ctrl mode (0xFC)."""
+        if not self.dagger_leader:
+            return
+        config_map = {"leader": 0xFA, "follower": 0xFC, "0xfa": 0xFA, "0xfc": 0xFC, "fa": 0xFA, "fc": 0xFC}
+        config_str = msg.data.lower().strip()
+        new_config = config_map.get(config_str)
+        if new_config is None:
+            rospy.logwarn("DAgger linkage_config: unknown value '%s'", msg.data)
+            return
+        if new_config == self.current_linkage_config:
+            return
+        try:
+            rospy.loginfo("DAgger: switching linkage config 0x%02X -> 0x%02X", self.current_linkage_config, new_config)
+            self.piper.MasterSlaveConfig(
+                linkage_config=new_config, feedback_offset=0x00, ctrl_offset=0x00, linkage_offset=0x00,
+            )
+            time.sleep(2)
+            if self.is_enabled:
+                self.piper.EnableArm(7)
+                time.sleep(2)
+            self.current_linkage_config = new_config
+            if new_config == 0xFA:
+                self._dagger_init_teach_mode()
+            else:
+                self._dagger_init_follower_control_mode()
+            rospy.loginfo("DAgger: linkage config switched to 0x%02X", new_config)
+        except Exception as e:
+            rospy.logerr("DAgger linkage_config callback failed: %s", e)
+
+    def teach_mode_callback(self, msg):
+        """Enter (1) or exit (0) drag-teach mode."""
+        if not self.dagger_leader:
+            return
+        try:
+            if msg.data == 1:
+                self.piper.MotionCtrl_1(grag_teach_ctrl=0x01)
+                self.in_teach_mode = True
+                rospy.loginfo("DAgger: entered drag-teach mode")
+            else:
+                self.piper.MotionCtrl_1(grag_teach_ctrl=0x02)
+                self.in_teach_mode = False
+                time.sleep(0.5)
+                self.piper.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=30)
+                rospy.loginfo("DAgger: exited drag-teach mode, CAN control active")
+        except Exception as e:
+            rospy.logerr("DAgger teach_mode callback failed: %s", e)
+
+    def controlled_joint_callback(self, joint_data):
+        """Execute joint commands sent while arm is in follower-control (CAN-ctrl) mode.
+
+        Only applies to 4CAN leader nodes while they are in 0xFC CAN-control
+        mode. Follower nodes are commanded exclusively by joint_callback.
+        """
+        if not self.dagger_leader:
+            return
+        if self.in_teach_mode:
+            return
+        if len(joint_data.position) < 7:
+            rospy.logwarn("DAgger leader command ignored short JointState: %d positions", len(joint_data.position))
+            return
+        factor = 57324.840764  # 1000 * 180 / pi
+        joint_0 = round(joint_data.position[0] * factor)
+        joint_1 = round(joint_data.position[1] * factor)
+        joint_2 = round(joint_data.position[2] * factor)
+        joint_3 = round(joint_data.position[3] * factor)
+        joint_4 = round(joint_data.position[4] * factor)
+        joint_5 = round(joint_data.position[5] * factor)
+        joint_6 = round(joint_data.position[6] * 1_000_000)
+        joint_6 = max(0, min(80000, joint_6))
+        if self.GetEnableFlag():
+            self.piper.MotionCtrl_2(0x01, 0x01, 30)
+            self.piper.JointCtrl(joint_0, joint_1, joint_2, joint_3, joint_4, joint_5)
+            if self.gripper_exist:
+                self.piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
+            self.piper.MotionCtrl_2(0x01, 0x01, 30)
+
+    def _dagger_init_teach_mode(self):
+        """Put arm into drag-teach mode (called after switching to 0xFA)."""
+        if self.is_enabled:
+            self.piper.EnableArm(7)
+            time.sleep(2)
+            self.piper.MotionCtrl_1(grag_teach_ctrl=0x01)
+            self.in_teach_mode = True
+            rospy.loginfo("DAgger: arm in drag-teach mode, human can drag now")
+
+    def _dagger_init_follower_control_mode(self):
+        """Put arm back into CAN-control mode (called after switching to 0xFC)."""
+        if self.is_enabled:
+            self.piper.MotionCtrl_1(grag_teach_ctrl=0x02)
+            self.in_teach_mode = False
+            time.sleep(1)
+            self.piper.EnableArm(7)
+            time.sleep(2)
+            self.piper.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=30)
+            rospy.loginfo("DAgger: arm in CAN-control mode")
 
     def SubPosThread(self):
         """Subscribe to end-effector pose commands."""
@@ -356,7 +544,6 @@ class C_PiperRosNode:
     def joint_callback(self, joint_data):
         """Handle joint commands."""
         factor = 57324.840764  # 1000*180/3.14
-        factor1 = 57.32484
         rospy.loginfo("Received Joint States:")
         rospy.loginfo("joint_0: %f", joint_data.position[0] * 1)
         rospy.loginfo("joint_1: %f", joint_data.position[1] * 1)
@@ -389,11 +576,13 @@ class C_PiperRosNode:
         rospy.loginfo("enable_flag: %s", enable_flag.data)
         if enable_flag.data:
             self.__enable_flag = True
+            self.is_enabled = True
             self.piper.EnableArm(7)
             self.piper.GripperCtrl(0, 1000, 0x02, 0)
             self.piper.GripperCtrl(0, 1000, 0x01, 0)
         else:
             self.__enable_flag = False
+            self.is_enabled = False
             self.piper.DisableArm(7)
             self.piper.GripperCtrl(0, 1000, 0x00, 0)
 

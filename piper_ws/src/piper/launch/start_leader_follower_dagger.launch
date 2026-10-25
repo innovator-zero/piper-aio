@@ -1,0 +1,66 @@
+<launch>
+  <!-- 4CAN DAgger: two dedicated leader CAN adapters + two follower CAN adapters. -->
+  <arg name="auto_enable_follower" default="true" />
+
+  <!-- Left leader arm: runtime-switchable between CAN-control sync (0xFC) and drag teach (0xFA). -->
+  <node name="$(anon piper_leader_left)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_left_lea" />
+    <param name="mode" value="0" />
+    <param name="auto_enable" value="false" />
+    <param name="dagger_leader" value="true" />
+    <remap from="/follower/arm_status" to="/leader_state/arm_status_left" />
+    <remap from="/follower/joint_states" to="/leader_state/joint_left" />
+    <remap from="/leader/joint_states" to="/leader/joint_left" />
+    <remap from="/follower/end_pose" to="/leader_state/end_pose_left" />
+    <remap from="/follower/end_pose_euler" to="/leader_state/end_pose_euler_left" />
+    <remap from="/teach/enable" to="/teach/leader_enable_left" />
+    <remap from="/teach/linkage_config" to="/teach/leader_config_left" />
+    <remap from="/teach/teach_mode" to="/teach/teach_mode_left" />
+    <remap from="/leader_cmd/joint_states" to="/leader_cmd/joint_left" />
+  </node>
+
+  <!-- Right leader arm. -->
+  <node name="$(anon piper_leader_right)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_right_lea" />
+    <param name="mode" value="0" />
+    <param name="auto_enable" value="false" />
+    <param name="dagger_leader" value="true" />
+    <remap from="/follower/arm_status" to="/leader_state/arm_status_right" />
+    <remap from="/follower/joint_states" to="/leader_state/joint_right" />
+    <remap from="/leader/joint_states" to="/leader/joint_right" />
+    <remap from="/follower/end_pose" to="/leader_state/end_pose_right" />
+    <remap from="/follower/end_pose_euler" to="/leader_state/end_pose_euler_right" />
+    <remap from="/teach/enable" to="/teach/leader_enable_right" />
+    <remap from="/teach/linkage_config" to="/teach/leader_config_right" />
+    <remap from="/teach/teach_mode" to="/teach/teach_mode_right" />
+    <remap from="/leader_cmd/joint_states" to="/leader_cmd/joint_right" />
+  </node>
+
+  <!-- Left follower arm: policy commands arrive on /follower_cmd/joint_left. -->
+  <node name="$(anon piper_follower_left)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_left_fol" />
+    <param name="mode" value="1" />
+    <param name="auto_enable" value="$(arg auto_enable_follower)" />
+    <remap from="/follower/arm_status" to="/follower/arm_status_left" />
+    <remap from="/follower/joint_states" to="/follower/joint_left" />
+    <remap from="/leader/joint_states" to="/follower_cmd/joint_left" />
+    <remap from="/follower/end_pose" to="/follower/end_pose_left" />
+    <remap from="/follower/end_pose_euler" to="/follower/end_pose_euler_left" />
+    <remap from="/pos_cmd" to="/follower/pos_cmd_left" />
+    <remap from="/enable_flag" to="/follower/enable_left" />
+  </node>
+
+  <!-- Right follower arm: policy commands arrive on /follower_cmd/joint_right. -->
+  <node name="$(anon piper_follower_right)" pkg="piper" type="piper_start_leader_follower_node.py" output="screen">
+    <param name="can_port" value="can_right_fol" />
+    <param name="mode" value="1" />
+    <param name="auto_enable" value="$(arg auto_enable_follower)" />
+    <remap from="/follower/arm_status" to="/follower/arm_status_right" />
+    <remap from="/follower/joint_states" to="/follower/joint_right" />
+    <remap from="/leader/joint_states" to="/follower_cmd/joint_right" />
+    <remap from="/follower/end_pose" to="/follower/end_pose_right" />
+    <remap from="/follower/end_pose_euler" to="/follower/end_pose_euler_right" />
+    <remap from="/pos_cmd" to="/follower/pos_cmd_right" />
+    <remap from="/enable_flag" to="/follower/enable_right" />
+  </node>
+</launch>
