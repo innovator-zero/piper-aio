@@ -6,7 +6,6 @@ import termios
 import threading
 import time
 import tty
-from collections import deque
 
 import numpy as np
 import rospy
@@ -17,10 +16,11 @@ from utils import (
     InferenceDataRecorder,
     check_keyboard_input,
     get_config,
-    get_inference_observation,
     get_rollout_observation,
     handle_interactive_mode,
+    inference_fn_sync,
     process_action,
+    reset_observation_window,
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,9 +28,6 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from ros_operator import RosOperator
-
-observation_window = None
-observation_window_lock = threading.Lock()
 
 shutdown_event = threading.Event()
 
@@ -46,83 +43,15 @@ def _on_sigint(signum, frame):
         pass
 
 
-def reset_observation_window():
-    """Reset observation window for a new episode."""
-    global observation_window
-    with observation_window_lock:
-        observation_window = None
-
-
-def update_observation_window(args, config, ros_operator):
-    global observation_window
-    with observation_window_lock:
-        if observation_window is None:
-            observation_window = deque(maxlen=2)
-
-            # Append the first dummy image
-            observation_window.append(
-                {
-                    "qpos": None,
-                    "images": {
-                        config["camera_names"][0]: None,
-                        config["camera_names"][1]: None,
-                        config["camera_names"][2]: None,
-                    },
-                    "eef_pose": None,
-                }
-            )
-
-    observation = get_inference_observation(args, config, ros_operator)
-    if observation is None:
-        return False
-
-    with observation_window_lock:
-        observation_window.append(observation)
-
-    return True
-
-
-def inference_fn_sync(args, config, policy, ros_operator):
-    if not update_observation_window(args, config, ros_operator):
-        return None
-
-    start_time = time.perf_counter()
-
-    with observation_window_lock:
-        # fetch images in sequence [front, left, right]
-        image_arrs = [
-            observation_window[-1]["images"][config["camera_names"][0]],
-            observation_window[-1]["images"][config["camera_names"][1]],
-            observation_window[-1]["images"][config["camera_names"][2]],
-        ]
-
-        if args.ctrl_type == "joint":
-            # state: Abs Joint 14dim
-            state = observation_window[-1]["qpos"]
-        elif args.ctrl_type == "eef":
-            # state: Abs EEF 14dim
-            state = observation_window[-1]["eef_pose"]
-        else:
-            raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
-
-    payload = {
-        "top": image_arrs[0],
-        "left": image_arrs[1],
-        "right": image_arrs[2],
-        "instruction": config["language_instruction"],
-        "state": state,
-    }
-
-    actions = policy.predict_action(payload)
-    print(f"Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms")
-
-    return actions
-
-
 # Main loop for the manipulation task
 def model_inference(args, config, ros_operator):
     if args.model == "openpi":
-        policy = OpenpiClient(host=args.host, port=args.port)
+        policy = OpenpiClient(
+            host=args.host,
+            port=args.port,
+            image_size=args.image_size,
+            prompt=config["language_instruction"],
+        )
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -398,6 +327,15 @@ def get_arguments():
         type=int,
         help="Websocket server port",
         default=8000,
+        required=False,
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        help="Desired image size for OpenPI preprocessing",
+        default=(224, 224),
         required=False,
     )
     parser.add_argument(

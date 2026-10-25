@@ -8,23 +8,32 @@ import rospy
 from cv_bridge import CvBridge
 from piper_msgs.msg import PosCmd
 from sensor_msgs.msg import Image, JointState
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header, Int32, String
 
 
 class RosOperator:
     queue_size_limit = 2000
+    default_leader_move_duration = 3.0
+    default_leader_move_rate_hz = 10
+    teach_publish_repeats = 3
+    teach_publish_interval = 0.05
+    teach_mode_settle_time = 0.5
+    teach_config_settle_time = 2.0
 
     def __init__(self, args, mode):
         self.args = args
-        if mode not in {"collection", "inference"}:
+        if mode not in {"collection", "inference", "dagger"}:
             raise ValueError(f"Unsupported RosOperator mode: {mode}")
         self.mode = mode
+        self.is_dagger = mode == "dagger"
         self.bridge = CvBridge()
 
         self.follower_arm_left_publisher = None
         self.follower_arm_right_publisher = None
         self.follower_arm_left_pose_publisher = None
         self.follower_arm_right_pose_publisher = None
+        self._leader_cmd_left_pub = None
+        self._leader_cmd_right_pub = None
         self.follower_arm_publish_thread = None
         self.follower_arm_publish_lock = threading.Lock()
         self.follower_arm_publish_lock.acquire()
@@ -66,6 +75,13 @@ class RosOperator:
                     "follower_arm_right_pose_queue",
                 ]
             )
+            if self.is_dagger:
+                queue_names.extend(
+                    [
+                        "leader_left_arm_queue",
+                        "leader_right_arm_queue",
+                    ]
+                )
         return queue_names
 
     def _init_queues(self):
@@ -368,6 +384,60 @@ class RosOperator:
             return self.get_collection_frame()
         return self.get_inference_frame()
 
+    def get_dagger_frame(self):
+        """Time-synced frame for DAgger data collection.
+
+        Returns the same fields as get_collection_frame() but can be called from
+        a dagger-mode RosOperator.
+        Leader arm positions are recorded as DAgger actions; follower positions
+        and images are recorded as observations.
+        """
+        stream_map = {
+            "img_front": self.front_image_queue,
+            "img_left": self.left_image_queue,
+            "img_right": self.right_image_queue,
+            "leader_arm_left": self.leader_left_arm_queue,
+            "leader_arm_right": self.leader_right_arm_queue,
+            "follower_arm_left": self.follower_left_arm_queue,
+            "follower_arm_right": self.follower_right_arm_queue,
+            "follower_arm_left_pose": self.follower_arm_left_pose_queue,
+            "follower_arm_right_pose": self.follower_arm_right_pose_queue,
+        }
+        if any(len(queue) == 0 for queue in stream_map.values()):
+            return False, self._format_sync_failure(stream_map)
+
+        frame_time = self._resolve_frame_time(self._camera_queues())
+        if not self._validate_stream_sync(stream_map, frame_time):
+            return False, self._format_sync_failure(stream_map, frame_time)
+
+        img_front = self._pop_synced_image(self.front_image_queue, frame_time)
+        img_left = self._pop_synced_image(self.left_image_queue, frame_time)
+        img_right = self._pop_synced_image(self.right_image_queue, frame_time)
+        leader_arm_left = self._pop_synced_message(self.leader_left_arm_queue, frame_time)
+        leader_arm_right = self._pop_synced_message(self.leader_right_arm_queue, frame_time)
+        follower_arm_left = self._pop_synced_message(self.follower_left_arm_queue, frame_time)
+        follower_arm_right = self._pop_synced_message(self.follower_right_arm_queue, frame_time)
+        _, follower_arm_left_pose = self._pop_synced_message(self.follower_arm_left_pose_queue, frame_time)
+        _, follower_arm_right_pose = self._pop_synced_message(self.follower_arm_right_pose_queue, frame_time)
+
+        return (
+            True,
+            (
+                img_front,
+                img_left,
+                img_right,
+                None,  # depth (unused)
+                None,
+                None,
+                follower_arm_left,
+                follower_arm_right,
+                follower_arm_left_pose,
+                follower_arm_right_pose,
+                leader_arm_left,
+                leader_arm_right,
+            ),
+        )
+
     def init_ros(self):
         node_name = "record_episodes" if self.mode == "collection" else "joint_state_publisher"
         rospy.init_node(node_name, anonymous=True)
@@ -420,16 +490,49 @@ class RosOperator:
                     ),
                 ]
             )
+            if self.is_dagger:
+                subscriber_specs.extend(
+                    [
+                        (self.args.leader_arm_left_topic, JointState, self._make_queue_callback("leader_left_arm_queue")),
+                        (self.args.leader_arm_right_topic, JointState, self._make_queue_callback("leader_right_arm_queue")),
+                    ]
+                )
 
         self._register_subscribers(subscriber_specs)
 
-        if self.mode == "inference":
-            self.follower_arm_left_publisher = rospy.Publisher(self.args.leader_arm_left_topic, JointState, queue_size=10)
-            self.follower_arm_right_publisher = rospy.Publisher(
-                self.args.leader_arm_right_topic, JointState, queue_size=10
-            )
+        if self.mode in {"inference", "dagger"}:
+            left_cmd_topic = getattr(self.args, "follower_cmd_left_topic", self.args.leader_arm_left_topic)
+            right_cmd_topic = getattr(self.args, "follower_cmd_right_topic", self.args.leader_arm_right_topic)
+            self.follower_arm_left_publisher = rospy.Publisher(left_cmd_topic, JointState, queue_size=10)
+            self.follower_arm_right_publisher = rospy.Publisher(right_cmd_topic, JointState, queue_size=10)
             self.follower_arm_left_pose_publisher = rospy.Publisher(self.args.pos_cmd_left_topic, PosCmd, queue_size=10)
             self.follower_arm_right_pose_publisher = rospy.Publisher(self.args.pos_cmd_right_topic, PosCmd, queue_size=10)
+
+            if self.is_dagger:
+                self._teach_enable_left_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_enable_left_topic", "/teach/leader_enable_left"), Bool, queue_size=10
+                )
+                self._teach_enable_right_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_enable_right_topic", "/teach/leader_enable_right"), Bool, queue_size=10
+                )
+                self._teach_config_left_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_config_left_topic", "/teach/leader_config_left"), String, queue_size=10
+                )
+                self._teach_config_right_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_config_right_topic", "/teach/leader_config_right"), String, queue_size=10
+                )
+                self._teach_mode_left_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_mode_left_topic", "/teach/teach_mode_left"), Int32, queue_size=10
+                )
+                self._teach_mode_right_pub = rospy.Publisher(
+                    getattr(self.args, "teach_leader_mode_right_topic", "/teach/teach_mode_right"), Int32, queue_size=10
+                )
+                self._leader_cmd_left_pub = rospy.Publisher(
+                    getattr(self.args, "leader_cmd_left_topic", "/leader_cmd/joint_left"), JointState, queue_size=10
+                )
+                self._leader_cmd_right_pub = rospy.Publisher(
+                    getattr(self.args, "leader_cmd_right_topic", "/leader_cmd/joint_right"), JointState, queue_size=10
+                )
 
     def process(self, keyboard_handler):
         """
@@ -512,14 +615,23 @@ class RosOperator:
                 follower_arm_right,
             )
 
-            zero_value_error = self._format_zero_value_failure(
-                [
-                    ("follower_arm_left.position", np.array(follower_arm_left.position)),
-                    ("follower_arm_right.position", np.array(follower_arm_right.position)),
-                    ("leader_arm_left.position", np.array(leader_arm_left.position)),
-                    ("leader_arm_right.position", np.array(leader_arm_right.position)),
-                ]
-            )
+            fixed_zero_arms = {self.args.fix_zero} if self.args.fix_zero in {"left", "right"} else set()
+            zero_value_checks = []
+            if "left" not in fixed_zero_arms:
+                zero_value_checks.extend(
+                    [
+                        ("follower_arm_left.position", np.array(follower_arm_left.position)),
+                        ("leader_arm_left.position", np.array(leader_arm_left.position)),
+                    ]
+                )
+            if "right" not in fixed_zero_arms:
+                zero_value_checks.extend(
+                    [
+                        ("follower_arm_right.position", np.array(follower_arm_right.position)),
+                        ("leader_arm_right.position", np.array(leader_arm_right.position)),
+                    ]
+                )
+            zero_value_error = self._format_zero_value_failure(zero_value_checks)
             if zero_value_error:
                 warning = f"arm data invalid: {zero_value_error}"
                 if warning != last_warning:
@@ -563,15 +675,46 @@ class RosOperator:
         print("len(actions)  : ", len(actions))
         return timesteps, actions, "q"
 
-    def follower_arm_publish(self, left_joint_positions, right_joint_positions):
+    def _make_joint_state(self, joint_positions):
         joint_state_msg = JointState()
         joint_state_msg.header = Header()
         joint_state_msg.header.stamp = rospy.Time.now()
         joint_state_msg.name = ["joint0", "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-        joint_state_msg.position = left_joint_positions
-        self.follower_arm_left_publisher.publish(joint_state_msg)
-        joint_state_msg.position = right_joint_positions
-        self.follower_arm_right_publisher.publish(joint_state_msg)
+        joint_state_msg.position = list(joint_positions)
+        joint_state_msg.velocity = [0.0] * 7
+        joint_state_msg.effort = [0.0] * 7
+        return joint_state_msg
+
+    def _publish_joint_pair(self, left_publisher, right_publisher, left_joint_positions, right_joint_positions):
+        left_msg = self._make_joint_state(left_joint_positions)
+        right_msg = self._make_joint_state(right_joint_positions)
+        left_publisher.publish(left_msg)
+        right_publisher.publish(right_msg)
+
+    def follower_arm_publish(self, left_joint_positions, right_joint_positions):
+        self._publish_joint_pair(
+            self.follower_arm_left_publisher,
+            self.follower_arm_right_publisher,
+            left_joint_positions,
+            right_joint_positions,
+        )
+
+    def leader_arm_publish(self, left_joint_positions, right_joint_positions):
+        self._publish_joint_pair(
+            self._leader_cmd_left_pub,
+            self._leader_cmd_right_pub,
+            left_joint_positions,
+            right_joint_positions,
+        )
+
+    def forward_leader_to_follower(self):
+        """Forward 4CAN leader actions to follower command topics during DAgger takeover."""
+        if len(self.leader_left_arm_queue) == 0 or len(self.leader_right_arm_queue) == 0:
+            return False
+        left_positions = list(self.leader_left_arm_queue[-1].position)
+        right_positions = list(self.leader_right_arm_queue[-1].position)
+        self.follower_arm_publish(left_positions, right_positions)
+        return True
 
     def follower_arm_pose_publish(self, left_pose, right_pose):
         pose_msg = PosCmd()
@@ -631,6 +774,104 @@ class RosOperator:
             step += 1
             print("follower_arm_publish_continuous:", step)
             rate.sleep()
+
+
+    def _publish_repeated_pair(self, left_publisher, right_publisher, msg, repeats=None):
+        repeat_count = self.teach_publish_repeats if repeats is None else repeats
+        for _ in range(repeat_count):
+            left_publisher.publish(msg)
+            right_publisher.publish(msg)
+            rospy.sleep(self.teach_publish_interval)
+
+    def _publish_teach_enable(self, enabled):
+        self._publish_repeated_pair(self._teach_enable_left_pub, self._teach_enable_right_pub, Bool(data=enabled))
+
+    def _publish_teach_config(self, config):
+        self._publish_repeated_pair(self._teach_config_left_pub, self._teach_config_right_pub, String(data=config))
+
+    def _publish_teach_mode(self, teach_mode):
+        self._publish_repeated_pair(self._teach_mode_left_pub, self._teach_mode_right_pub, Int32(data=teach_mode))
+
+    def _publish_leader_targets_for_duration(self, left_positions, right_positions):
+        rate = rospy.Rate(self.default_leader_move_rate_hz)
+        end_time = rospy.Time.now().to_sec() + self.default_leader_move_duration
+        while not rospy.is_shutdown() and rospy.Time.now().to_sec() < end_time:
+            self.leader_arm_publish(left_positions, right_positions)
+            rate.sleep()
+
+    def set_leaders_can_control(self):
+        """Put DAgger leader arms in CAN-control mode before publishing leader commands."""
+        if not self.is_dagger:
+            return True
+        self._publish_teach_mode(0)
+        rospy.sleep(self.teach_mode_settle_time)
+        self._publish_teach_config("follower")
+        rospy.sleep(self.teach_config_settle_time)
+        self._publish_teach_enable(True)
+        rospy.sleep(self.teach_config_settle_time)
+        rospy.loginfo("DAgger: leader arms are in CAN-control mode")
+        return True
+
+    def set_leaders_drag_teach(self):
+        """Put DAgger leader arms in drag-teach mode for human demonstration."""
+        if not self.is_dagger:
+            return True
+        self._publish_teach_enable(True)
+        rospy.sleep(self.teach_mode_settle_time)
+        self._publish_teach_config("leader")
+        rospy.sleep(self.teach_config_settle_time)
+        self._publish_teach_mode(1)
+        rospy.sleep(self.teach_mode_settle_time)
+        rospy.loginfo("DAgger: leader arms are in drag-teach mode")
+        return True
+
+    def move_leaders_to_pose(self, left_positions, right_positions, description):
+        """Move DAgger leader arms to a target pose after entering CAN-control mode."""
+        if self._leader_cmd_left_pub is None or self._leader_cmd_right_pub is None:
+            rospy.logwarn("DAgger: leader command publishers are not available; skipping leader move")
+            return False
+        self.set_leaders_can_control()
+        rospy.loginfo("DAgger: moving leader arms to %s", description)
+        self._publish_leader_targets_for_duration(left_positions, right_positions)
+        return True
+
+    def move_arms_to_initial_pose(self, left_positions, right_positions):
+        """Move both leader and follower arms back to the task initial pose."""
+        rospy.loginfo("DAgger: moving leader and follower arms to task initial pose")
+        leader_ok = True
+        if self.is_dagger:
+            leader_ok = self.move_leaders_to_pose(
+                left_positions,
+                right_positions,
+                "task initial pose",
+            )
+        self.follower_arm_publish_continuous(left_positions, right_positions)
+        return leader_ok
+
+    def move_leaders_to_follower_pose(self):
+        if len(self.follower_left_arm_queue) == 0 or len(self.follower_right_arm_queue) == 0:
+            rospy.logerr("DAgger: cannot sync leader arms, follower arm queues are empty")
+            return False
+        left_positions = list(self.follower_left_arm_queue[-1].position)
+        right_positions = list(self.follower_right_arm_queue[-1].position)
+        return self.move_leaders_to_pose(
+            left_positions,
+            right_positions,
+            "current follower positions",
+        )
+
+    def enter_dagger_mode(self):
+        """Enable 4CAN leader arms, sync them to followers, then enter drag-teach mode."""
+        if not self.move_leaders_to_follower_pose():
+            return False
+
+        return self.set_leaders_drag_teach()
+
+    def exit_dagger_mode(self):
+        """Return 4CAN leader arms to CAN-control mode so inference can resume."""
+        self.set_leaders_can_control()
+        rospy.loginfo("DAgger: leader arms are back in CAN-control mode")
+        return True
 
 
 def get_ros_observation(args, ros_operator):

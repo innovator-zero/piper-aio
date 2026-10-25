@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
 from utils import (
     InferenceDataRecorder,
+    apply_fixed_arms_to_initial_pose,
     check_keyboard_input,
     get_config,
     get_inference_observation,
@@ -115,6 +116,35 @@ def update_observation_window(args, config, ros_operator):
     return True
 
 
+def build_policy_payload(args, config, action_prefix=None, delay=None):
+    with observation_window_lock:
+        observation = observation_window[-1]
+        image_arrs = [
+            observation["images"][config["camera_names"][0]],
+            observation["images"][config["camera_names"][1]],
+            observation["images"][config["camera_names"][2]],
+        ]
+
+        if args.ctrl_type == "joint":
+            state = observation["qpos"]
+        elif args.ctrl_type == "eef":
+            state = observation["eef_pose"]
+        else:
+            raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
+
+    payload = {
+        "top": image_arrs[0],
+        "left": image_arrs[1],
+        "right": image_arrs[2],
+        "instruction": config["language_instruction"],
+        "state": state,
+    }
+    if action_prefix is not None:
+        payload["action_prefix"] = action_prefix
+        payload["delay"] = delay
+    return payload
+
+
 class StreamActionBuffer:
 
     def __init__(self, delay, exec_horizon, state_dim):
@@ -150,14 +180,8 @@ class StreamActionBuffer:
             if require_full_current and self.cur_len != self.exec_horizon:
                 return False
 
-            if self.exec_horizon > self.delay:
-                launch_step = self.exec_horizon - self.delay - 1
-                ready = self.cur_step >= launch_step
-            else:
-                # In continuous mode, launch once per chunk as soon as the async thread is free.
-                ready = self.cur_step >= 0
-
-            if not ready:
+            launch_step = max(0, self.exec_horizon - self.delay - 1)
+            if self.cur_step < launch_step:
                 return False
 
             self.last_launch_stamp = self.cur_stamp
@@ -250,38 +274,13 @@ def inference_fn_sync(args, config, policy, ros_operator):
         return None
 
     start_time = time.perf_counter()
-
-    with observation_window_lock:
-        # fetch images in sequence [front, left, right]
-        image_arrs = [
-            observation_window[-1]["images"][config["camera_names"][0]],
-            observation_window[-1]["images"][config["camera_names"][1]],
-            observation_window[-1]["images"][config["camera_names"][2]],
-        ]
-
-        if args.ctrl_type == "joint":
-            # state: Abs Joint 14dim
-            state = observation_window[-1]["qpos"]
-        elif args.ctrl_type == "eef":
-            # state: Abs EEF 14dim
-            state = observation_window[-1]["eef_pose"]
-        else:
-            raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
-
-    payload = {
-        "top": image_arrs[0],
-        "left": image_arrs[1],
-        "right": image_arrs[2],
-        "instruction": config["language_instruction"],
-        "state": state,
-        "action_prefix": None,
-        "delay": None,
-    }
+    payload = build_policy_payload(args, config)
 
     if args.streaming:
         actions = policy.predict_action_streaming(payload)
     else:
         actions = policy.predict_action(payload)
+    actions = apply_fixed_arms_to_initial_pose(actions, config, target="action")
     print(f"[Sync   {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms")
     inference_stamp += 1
 
@@ -324,33 +323,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
                 continue
 
             start_time = time.perf_counter()
-
-            with observation_window_lock:
-                # fetch images in sequence [front, left, right]
-                image_arrs = [
-                    observation_window[-1]["images"][config["camera_names"][0]],
-                    observation_window[-1]["images"][config["camera_names"][1]],
-                    observation_window[-1]["images"][config["camera_names"][2]],
-                ]
-
-                if args.ctrl_type == "joint":
-                    # state: Abs Joint 14dim
-                    state = observation_window[-1]["qpos"]
-                elif args.ctrl_type == "eef":
-                    # state: Abs EEF 14dim
-                    state = observation_window[-1]["eef_pose"]
-                else:
-                    raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
-
-            payload = {
-                "top": image_arrs[0],
-                "left": image_arrs[1],
-                "right": image_arrs[2],
-                "instruction": config["language_instruction"],
-                "state": state,
-                "action_prefix": action_prefix,
-                "delay": delay,
-            }
+            payload = build_policy_payload(args, config, action_prefix=action_prefix, delay=delay)
 
             def on_actions_ready(actions_chunk):
                 if not is_current_episode(request_episode_id):
@@ -358,6 +331,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
                         f"Discard async streaming chunk from stale episode {request_episode_id}; current={episode_id}"
                     )
                     return
+                actions_chunk = apply_fixed_arms_to_initial_pose(actions_chunk, config, target="action")
                 action_buffer.integrate_new_chunk_streaming(actions_chunk, stamp=inference_stamp)
 
             if args.streaming:
@@ -367,6 +341,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
                 )
             else:
                 actions = policy.predict_action(payload)
+                actions = apply_fixed_arms_to_initial_pose(actions, config, target="action")
                 print(
                     f"[Async  {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms"
                 )
@@ -409,7 +384,12 @@ def model_inference(args, config, ros_operator):
     global inference_stamp
 
     if args.model == "openpi":
-        policy = OpenpiClient(host=args.host, port=args.port)
+        policy = OpenpiClient(
+            host=args.host,
+            port=args.port,
+            image_size=args.image_size,
+            prompt=config["language_instruction"],
+        )
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -718,6 +698,15 @@ def get_arguments():
         type=int,
         help="Websocket server port",
         default=8000,
+        required=False,
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        help="Desired image size for OpenPI preprocessing",
+        default=(224, 224),
         required=False,
     )
     parser.add_argument(
