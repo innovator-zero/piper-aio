@@ -2,12 +2,17 @@
   <h1 align="center">Piper All In One</h1>
 </p>
 
+<p align="center">
+  <img src="docs/assets/teaser.png" alt="Piper All In One: Piper robot with a workflow for teleoperated data collection, data curation and replay, LeRobot dataset conversion, and policy inference." width="100%">
+</p>
+
 Piper All In One is an imitation-learning stack for [AgileX Piper](https://global.agilex.ai/products/piper) robotic arms and [Cobot Magic](https://global.agilex.ai/products/cobot-magic) systems. It covers the full robot-learning loop: hardware bring-up, teleoperated data collection, data replay, LeRobot dataset conversion, and policy inference.
 
 > ‼️ Safety first: this repository controls real robot arms. Keep the emergency stop reachable, start from a clear workspace, verify CAN/camera mappings before motion, and test every new policy with slow, supervised motions before normal operation.
 
 ## 📰 News
 
+- **Oct 25 2026**: Update to v1.1, added support for async ensemble inference and human-guided DAgger.
 - **Apr 29 2026**: Repository released.
 
 ## 📋 Contents
